@@ -1,0 +1,9 @@
+[project]
+name = "scripts"
+version = "0.1.0"
+description = "Some scripts, mostly 'one-off' but potentially reusable."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pillow>=12.2.0",
+]
