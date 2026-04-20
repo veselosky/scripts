@@ -365,6 +365,45 @@ def parse_date_rank(raw_date: str | None) -> tuple[int, int, int, int]:
     return (0, 0, 0, 0)
 
 
+def to_rfc3339_date(raw_date: str | None) -> str:
+    if not raw_date:
+        return ""
+
+    value = raw_date.strip()
+    if not value:
+        return ""
+
+    best_rank = (0, 0, 0, 0)
+    best_dt: datetime | None = None
+
+    for pattern in DATE_PATTERNS:
+        try:
+            dt = datetime.strptime(value, pattern)
+        except ValueError:
+            continue
+
+        if pattern in {"%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y"}:
+            rank = (dt.year, dt.month, dt.day, 3)
+        elif pattern in {"%Y-%m", "%Y/%m", "%B %Y", "%b %Y"}:
+            rank = (dt.year, dt.month, 0, 2)
+        else:
+            rank = (dt.year, 0, 0, 1)
+
+        if rank > best_rank:
+            best_rank = rank
+            best_dt = dt
+
+    if best_dt is not None:
+        return best_dt.strftime("%Y-%m-%dT00:00:00Z")
+
+    years = [int(match) for match in re.findall(r"\b(1[5-9]\d\d|20\d\d|2100)\b", value)]
+    if years:
+        year = max(years)
+        return f"{year:04d}-01-01T00:00:00Z"
+
+    return ""
+
+
 def pick_publish_date(edition: dict[str, Any]) -> str:
     publish_date = edition.get("publish_date")
 
@@ -630,7 +669,7 @@ def process_book(
     edition = selected.edition
     resolved_title = str(edition.get("title", "")).strip() or selected.work_title or book.title
     resolved_subtitle = pick_subtitle(edition)
-    publish_date = pick_publish_date(edition)
+    publish_date = to_rfc3339_date(pick_publish_date(edition))
     isbn = pick_isbn(edition)
     publisher = pick_publisher(edition)
     description = pick_description(edition)
