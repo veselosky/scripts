@@ -55,11 +55,14 @@ NON_PRINT_TERMS = (
     "kindle",
     "epub",
     "pdf",
+    "digital",
+)
+AUDIO_TERMS = (
     "audiobook",
     "audio book",
+    "audio cd",
     "cd",
     "mp3",
-    "digital",
 )
 
 
@@ -78,6 +81,7 @@ class EditionSelection:
     edition: dict[str, Any]
     book_format: str
     date_rank: tuple[int, int, int, int]
+    used_print_fallback: bool
 
 
 class OpenLibraryClient:
@@ -287,27 +291,7 @@ def pick_work_candidate(
     return max(docs, key=score_doc)
 
 
-def extract_language_codes(edition: dict[str, Any]) -> set[str]:
-    languages = edition.get("languages", [])
-    result: set[str] = set()
-
-    if not isinstance(languages, list):
-        return result
-
-    for entry in languages:
-        if isinstance(entry, str):
-            result.add(entry.casefold())
-            continue
-
-        if isinstance(entry, dict):
-            key = str(entry.get("key", ""))
-            if "/languages/" in key:
-                result.add(key.rsplit("/", maxsplit=1)[-1].casefold())
-
-    return result
-
-
-def detect_print_format(edition: dict[str, Any]) -> str | None:
+def detect_book_format(edition: dict[str, Any]) -> str:
     format_values: list[str] = []
 
     physical_format = edition.get("physical_format")
@@ -322,14 +306,25 @@ def detect_print_format(edition: dict[str, Any]) -> str | None:
 
     format_blob = " ".join(format_values).casefold()
 
-    if any(term in format_blob for term in NON_PRINT_TERMS):
-        return None
-
     if any(term in format_blob for term in PRINT_HARDCOVER_TERMS):
         return "Hardcover"
 
     if any(term in format_blob for term in PRINT_PAPERBACK_TERMS):
         return "Paperback"
+
+    if any(term in format_blob for term in AUDIO_TERMS):
+        return "Audiobook"
+
+    if any(term in format_blob for term in NON_PRINT_TERMS):
+        return "EBook"
+
+    return ""
+
+
+def detect_print_format(edition: dict[str, Any]) -> str | None:
+    detected = detect_book_format(edition)
+    if detected in {"Hardcover", "Paperback"}:
+        return detected
 
     return None
 
@@ -448,6 +443,9 @@ def extract_cover_id(edition: dict[str, Any]) -> int | None:
                 continue
 
     cover_i = edition.get("cover_i")
+    if cover_i is None:
+        return None
+
     try:
         return int(cover_i)
     except (TypeError, ValueError):
@@ -460,39 +458,52 @@ def choose_latest_print_edition(
     author_name: str,
     editions: list[dict[str, Any]],
 ) -> EditionSelection | None:
-    candidates: list[EditionSelection] = []
+    print_candidates: list[EditionSelection] = []
+    fallback_candidates: list[EditionSelection] = []
 
     for edition in editions:
-        language_codes = extract_language_codes(edition)
-        if "eng" not in language_codes:
-            continue
-
-        book_format = detect_print_format(edition)
-        if book_format not in {"Hardcover", "Paperback"}:
-            continue
-
         publish_date = pick_publish_date(edition)
         date_rank = parse_date_rank(publish_date)
+        detected_format = detect_book_format(edition)
 
-        candidates.append(
+        fallback_candidates.append(
             EditionSelection(
                 work_key=work_key,
                 work_title=work_title,
                 author_name=author_name,
                 edition=edition,
-                book_format=book_format,
+                book_format=detected_format,
                 date_rank=date_rank,
+                used_print_fallback=True,
             )
         )
 
-    if not candidates:
-        return None
+        if detected_format not in {"Hardcover", "Paperback"}:
+            continue
+
+        print_candidates.append(
+            EditionSelection(
+                work_key=work_key,
+                work_title=work_title,
+                author_name=author_name,
+                edition=edition,
+                book_format=detected_format,
+                date_rank=date_rank,
+                used_print_fallback=False,
+            )
+        )
 
     def sort_key(selection: EditionSelection) -> tuple[tuple[int, int, int, int], str]:
         key = str(selection.edition.get("key", ""))
         return (selection.date_rank, key)
 
-    return max(candidates, key=sort_key)
+    if print_candidates:
+        return max(print_candidates, key=sort_key)
+
+    if fallback_candidates:
+        return max(fallback_candidates, key=sort_key)
+
+    return None
 
 
 def build_front_matter(
@@ -609,7 +620,7 @@ def process_book(
     selected = choose_latest_print_edition(work_key, work_title, chosen_author, editions)
     if selected is None:
         logger.warning(
-            "No English print editions found for work %s (%s by %s)",
+            "No selectable editions found for work %s (%s by %s)",
             work_key,
             book.title,
             book.author,
@@ -653,11 +664,12 @@ def process_book(
     write_markdown(markdown_path, front_matter, description)
 
     logger.info(
-        "SUCCESS: wrote %s using edition %s (%s %s)",
+        "SUCCESS: wrote %s using edition %s (%s %s)%s",
         markdown_path.name,
         str(edition.get("key", "")),
-        selected.book_format,
+        selected.book_format or "",
         publish_date,
+        " [fallback: no print format detected]" if selected.used_print_fallback else "",
     )
 
 
