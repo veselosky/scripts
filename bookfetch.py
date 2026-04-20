@@ -172,6 +172,37 @@ class OpenLibraryClient:
 
         return editions
 
+    def fetch_author(self, author_olid: str) -> dict[str, Any]:
+        url = f"{OPENLIBRARY_BASE_URL}/authors/{author_olid}.json"
+        response = self._get(url)
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def fetch_author_works(self, author_olid: str) -> list[dict[str, Any]]:
+        works: list[dict[str, Any]] = []
+        offset = 0
+        limit = 200
+
+        while True:
+            url = f"{OPENLIBRARY_BASE_URL}/authors/{author_olid}/works.json"
+            response = self._get(url, params={"limit": limit, "offset": offset})
+            payload = response.json()
+            entries = payload.get("entries", [])
+            if not isinstance(entries, list) or not entries:
+                break
+
+            for entry in entries:
+                if isinstance(entry, dict):
+                    works.append(entry)
+
+            offset += len(entries)
+            if len(entries) < limit:
+                break
+
+        return works
+
     def download_cover(self, cover_id: int) -> tuple[bytes, str]:
         url = f"{COVERS_URL}/b/id/{cover_id}-L.jpg"
         response = self._get(url)
@@ -189,9 +220,24 @@ class OpenLibraryClient:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch latest English print editions from Open Library and output Markdown files."
+        description=(
+            "Fetch latest English print editions from Open Library and output Markdown files. "
+            "Provide either an input file or --author <olid>."
+        )
     )
-    parser.add_argument("input_file", help="Path to input text file containing 'Title by Author' lines")
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        help="Path to input text file containing 'Title by Author' lines",
+    )
+    parser.add_argument(
+        "--author",
+        dest="author_olid",
+        help=(
+            "Open Library author OLID (example: OL23919A). "
+            "When set, retrieves all works from /authors/<olid>/works.json instead of reading input_file."
+        ),
+    )
     parser.add_argument(
         "--output-dir",
         default=".",
@@ -202,7 +248,27 @@ def parse_args() -> argparse.Namespace:
         default="bookfetch.log",
         help="Path to log file (default: ./bookfetch.log)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    has_input = bool(args.input_file)
+    has_author = bool(args.author_olid)
+    if has_input == has_author:
+        parser.error("Provide exactly one of: input_file or --author <olid>")
+
+    return args
+
+
+def normalize_author_olid(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+
+    value = re.sub(r"^https?://openlibrary\.org/authors/", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^/authors/", "", value, flags=re.IGNORECASE)
+    value = value.strip("/")
+    value = value.split("/", maxsplit=1)[0]
+    value = value.split("?", maxsplit=1)[0]
+    return value.strip()
 
 
 def setup_logger(log_path: Path) -> logging.Logger:
@@ -651,23 +717,43 @@ def process_book(
     else:
         chosen_author = book.author
 
+    process_work_key(
+        work_key=work_key,
+        work_title=work_title,
+        author_name=chosen_author,
+        client=client,
+        output_dir=output_dir,
+        used_slugs=used_slugs,
+        logger=logger,
+    )
+
+
+def process_work_key(
+    work_key: str,
+    work_title: str,
+    author_name: str,
+    client: OpenLibraryClient,
+    output_dir: Path,
+    used_slugs: set[str],
+    logger: logging.Logger,
+) -> None:
     editions = client.fetch_work_editions(work_key)
     if not editions:
         logger.warning("No editions found for work %s", work_key)
         return
 
-    selected = choose_latest_print_edition(work_key, work_title, chosen_author, editions)
+    selected = choose_latest_print_edition(work_key, work_title, author_name, editions)
     if selected is None:
         logger.warning(
             "No selectable editions found for work %s (%s by %s)",
             work_key,
-            book.title,
-            book.author,
+            work_title,
+            author_name,
         )
         return
 
     edition = selected.edition
-    resolved_title = str(edition.get("title", "")).strip() or selected.work_title or book.title
+    resolved_title = str(edition.get("title", "")).strip() or selected.work_title or work_title
     resolved_subtitle = pick_subtitle(edition)
     publish_date = to_rfc3339_date(pick_publish_date(edition))
     isbn = pick_isbn(edition)
@@ -712,20 +798,99 @@ def process_book(
     )
 
 
+def process_author_works(
+    author_olid: str,
+    client: OpenLibraryClient,
+    output_dir: Path,
+    used_slugs: set[str],
+    logger: logging.Logger,
+) -> None:
+    author_record = client.fetch_author(author_olid)
+    author_name = str(author_record.get("name", "")).strip() or author_olid
+
+    works = client.fetch_author_works(author_olid)
+    if not works:
+        logger.warning("No works found for author %s", author_olid)
+        return
+
+    logger.info("Found %d works for author %s (%s)", len(works), author_name, author_olid)
+
+    for work in works:
+        work_key = str(work.get("key", "")).strip()
+        if not work_key.startswith("/works/"):
+            logger.warning("Skipping author work with invalid key: %s", work_key)
+            continue
+
+        work_title = str(work.get("title", "")).strip() or work_key
+        logger.info("Processing author work: %s (%s)", work_title, work_key)
+
+        try:
+            process_work_key(
+                work_key=work_key,
+                work_title=work_title,
+                author_name=author_name,
+                client=client,
+                output_dir=output_dir,
+                used_slugs=used_slugs,
+                logger=logger,
+            )
+        except requests.RequestException:
+            logger.exception("Network error while processing work %s", work_key)
+        except OSError:
+            logger.exception("Filesystem error while processing work %s", work_key)
+        except Exception:
+            logger.exception("Unexpected error while processing work %s", work_key)
+
+
 def main() -> int:
     args = parse_args()
-    input_path = Path(args.input_file)
+    input_path = Path(args.input_file) if args.input_file else None
     output_dir = Path(args.output_dir)
     log_path = Path(args.log_file)
+    author_olid = normalize_author_olid(args.author_olid) if args.author_olid else ""
 
-    if not input_path.is_file():
+    if input_path is not None and not input_path.is_file():
         print(f"Error: input file not found: {input_path}", file=sys.stderr)
+        return 1
+
+    if args.author_olid and not author_olid:
+        print("Error: invalid --author value", file=sys.stderr)
         return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(log_path)
     logger.info("Starting bookfetch")
+
+    client = OpenLibraryClient(logger=logger, min_interval_seconds=1.0)
+    used_slugs: set[str] = set()
+
+    if author_olid:
+        logger.info("Author mode enabled for %s", author_olid)
+        try:
+            process_author_works(
+                author_olid=author_olid,
+                client=client,
+                output_dir=output_dir,
+                used_slugs=used_slugs,
+                logger=logger,
+            )
+        except requests.RequestException:
+            logger.exception("Network error while processing author %s", author_olid)
+            return 1
+        except OSError:
+            logger.exception("Filesystem error while processing author %s", author_olid)
+            return 1
+        except Exception:
+            logger.exception("Unexpected error while processing author %s", author_olid)
+            return 1
+
+        logger.info("Completed bookfetch")
+        return 0
+
+    if input_path is None:
+        print("Error: missing input file", file=sys.stderr)
+        return 1
 
     try:
         books = parse_input_file(input_path, logger)
@@ -737,9 +902,6 @@ def main() -> int:
     if not books:
         logger.warning("No valid book lines found in input file")
         return 0
-
-    client = OpenLibraryClient(logger=logger, min_interval_seconds=1.0)
-    used_slugs: set[str] = set()
 
     for book in books:
         try:
