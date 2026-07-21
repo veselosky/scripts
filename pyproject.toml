@@ -5,7 +5,7 @@ description = "Some scripts, mostly 'one-off' but potentially reusable."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "pillow>=12.2.0",
+    "pillow>=12.3.0",
     "PyYAML>=6.0.2",
     "python-slugify>=8.0.4",
     "requests>=2.32.5",
